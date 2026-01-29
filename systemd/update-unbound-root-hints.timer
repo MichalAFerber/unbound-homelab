@@ -1,0 +1,14 @@
+[Unit]
+Description=Monthly update of Unbound root hints
+Documentation=https://github.com/yourusername/unbound-homelab
+
+[Timer]
+# Run on the 1st of every month at 03:15 AM
+OnCalendar=monthly
+# Randomize start time by up to 1 hour to avoid overwhelming IANA
+RandomizedDelaySec=1h
+# If a scheduled run was missed (e.g., system was off), run on next boot
+Persistent=true
+
+[Install]
+WantedBy=timers.target

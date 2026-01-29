@@ -1,0 +1,24 @@
+# /etc/unbound/hosts.d/mykk.foo.tsv
+# DNS hosts source file for mykk.foo zone
+#
+# Format: hostname<TAB>ip_address<TAB>aliases (comma-separated, optional)
+# Lines starting with # are ignored
+# Empty lines are ignored
+#
+# After editing this file, run: sudo /usr/local/sbin/update_dns.sh
+# To sync to secondary: sudo /usr/local/sbin/sync_dns_to_secondary.sh
+
+# Infrastructure
+pi4server	192.168.50.2	dns1
+pi4server02	192.168.50.3	dns2
+
+# Media Services
+plex	192.168.50.205	media
+truenas	192.168.50.202	nas
+
+# Home Automation
+pihole	192.168.50.210
+homeassistant	192.168.50.220	ha
+
+# Add more hosts below
+# example	192.168.50.100	alias1,alias2

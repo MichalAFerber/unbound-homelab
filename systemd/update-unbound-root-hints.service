@@ -1,0 +1,22 @@
+[Unit]
+Description=Update Unbound Root Hints
+Documentation=https://github.com/yourusername/unbound-homelab
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/update-unbound-root-hints.sh
+User=root
+StandardOutput=journal
+StandardError=journal
+
+# Security hardening
+PrivateTmp=yes
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/unbound /tmp
+
+[Install]
+WantedBy=multi-user.target
