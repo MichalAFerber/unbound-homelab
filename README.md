@@ -275,10 +275,9 @@ MIT License - see LICENSE file for details
 
 ## Support
 
-- **Issues**: [GitHub Issues](https://github.com/yourusername/unbound-homelab/issues)
-- **Blog Post**: [Full writeup on michalferber.me](https://michalferber.me)
-- **Email**: your@email.com
+- **Issues**: [GitHub Issues](https://github.com/MichalAFerber/unbound-homelab/issues)
+- **Blog Post**: [Full writeup on michalferber.me](https://michalferber.me/2025-09-22-building-a-redundant-unbound-dns-setup-in-my-home-lab)
 
 ---
 
-**Built with ❤️ for home lab enthusiasts**
+**Created with ❤️ by Michal Ferber, aka TechGuyWithABeard**
