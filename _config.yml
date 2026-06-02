@@ -1,0 +1,4 @@
+theme: jekyll-theme-cayman
+title: unbound-homelab
+description: Production-ready redundant DNS infrastructure for home labs using Unbound — two-node failover with health checks and zero-downtime config reloads.
+show_downloads: false
