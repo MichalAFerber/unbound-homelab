@@ -1,495 +1,145 @@
-# Unbound DNS Cheatsheet
+# Cheatsheet
 
-Quick reference for common tasks and commands.
+Daily ops reference for the Unbound + Kea setup. Replace `dns-primary` / `dns-secondary` / `192.168.X.10` / `192.168.X.11` with your actual hostnames and IPs.
 
-## Essential Commands
-
-### DNS Operations
+## Service control
 
 ```bash
-# Regenerate DNS config from TSV
-sudo /usr/local/sbin/update_dns.sh
-
-# Sync to secondary server (run from primary)
-sudo /usr/local/sbin/sync_dns_to_secondary.sh
-
-# Health check both servers
-/usr/local/sbin/dns-check.sh
-
-# Update root hints manually
-sudo /usr/local/sbin/update-unbound-root-hints.sh
-```
-
-### Service Management
-
-```bash
-# Start/Stop/Restart Unbound
-sudo systemctl start unbound
+# Unbound (run on each resolver)
+sudo systemctl status unbound --no-pager
+sudo systemctl reload unbound          # config change, no cache flush
+sudo systemctl restart unbound         # config change + cache flush
 sudo systemctl stop unbound
-sudo systemctl restart unbound
+sudo systemctl start unbound
 
-# Check status
-sudo systemctl status unbound
-
-# Enable/disable autostart
-sudo systemctl enable unbound
-sudo systemctl disable unbound
+# Kea (on the host running DHCP)
+sudo systemctl status kea-dhcp4-server --no-pager
+sudo systemctl restart kea-dhcp4-server
 ```
 
-### Systemd Timer
+## Validate config before applying
 
 ```bash
-# Check timer status
-systemctl status update-unbound-root-hints.timer
-
-# List all timers
-systemctl list-timers
-
-# Enable/disable timer
-sudo systemctl enable update-unbound-root-hints.timer
-sudo systemctl disable update-unbound-root-hints.timer
-
-# Manually trigger the service
-sudo systemctl start update-unbound-root-hints.service
-```
-
-## Testing DNS Resolution
-
-### Local Queries
-
-```bash
-# Test local DNS server
-dig @localhost google.com
-dig @localhost example.mykk.foo
-
-# Test specific server
-dig @192.168.50.2 google.com
-dig @192.168.50.3 plex.mykk.foo
-
-# Quick lookup (no details)
-dig +short @localhost google.com
-
-# Test with different record types
-dig @localhost example.com MX
-dig @localhost example.com AAAA
-dig @localhost example.com TXT
-```
-
-### Reverse DNS Lookup
-
-```bash
-# PTR record lookup
-dig -x 192.168.50.2
-dig +short -x 192.168.50.205
-```
-
-### Performance Testing
-
-```bash
-# Time a query
-time dig @localhost google.com
-
-# Test cache hit vs miss
-dig @localhost example.com          # First query (miss)
-dig @localhost example.com          # Second query (hit)
-
-# Benchmark with hyperfine (if installed)
-hyperfine 'dig @localhost google.com'
-```
-
-### Advanced Testing
-
-```bash
-# Trace full resolution path
-dig +trace google.com
-
-# Show all details
-dig +all @localhost google.com
-
-# Query with TCP instead of UDP
-dig +tcp @localhost google.com
-
-# Query with specific timeout
-dig +time=1 +tries=1 @localhost google.com
-```
-
-## Managing Hosts
-
-### Add a Host
-
-```bash
-# Single host
-printf "hostname\t192.168.50.100\n" | sudo tee -a /etc/unbound/hosts.d/mykk.foo.tsv
-sudo /usr/local/sbin/update_dns.sh
-
-# Host with aliases
-printf "hostname\t192.168.50.100\talias1,alias2\n" | sudo tee -a /etc/unbound/hosts.d/mykk.foo.tsv
-sudo /usr/local/sbin/update_dns.sh
-```
-
-### Edit Hosts
-
-```bash
-# Edit the TSV file
-sudo nano /etc/unbound/hosts.d/mykk.foo.tsv
-
-# Then regenerate
-sudo /usr/local/sbin/update_dns.sh
-```
-
-### Remove a Host
-
-```bash
-# Edit TSV and remove the line
-sudo nano /etc/unbound/hosts.d/mykk.foo.tsv
-
-# Then regenerate
-sudo /usr/local/sbin/update_dns.sh
-```
-
-## Configuration Files
-
-### Main Config Locations
-
-```bash
-# Main Unbound config
-sudo nano /etc/unbound/unbound.conf.d/lan53.conf
-
-# Local zone config (auto-generated)
-sudo nano /etc/unbound/unbound.conf.d/local-zone-mykk-foo.conf
-
-# Hosts database
-sudo nano /etc/unbound/hosts.d/mykk.foo.tsv
-```
-
-### Validate Configuration
-
-```bash
-# Check all configs
+# Unbound — fails loudly if the conf is broken; safer than reload-and-see
 sudo unbound-checkconf
 
-# Check specific file
-sudo unbound-checkconf /etc/unbound/unbound.conf
+# Kea — JSON syntax + semantic check
+sudo kea-dhcp4 -t /etc/kea/kea-dhcp4.conf
 ```
 
-## Logging and Debugging
-
-### View Logs
+## DNS query testing
 
 ```bash
-# Real-time logs
-sudo journalctl -u unbound -f
+# From a LAN client — test each resolver explicitly
+dig @192.168.X.10 router.home.lan      # local zone, primary
+dig @192.168.X.11 router.home.lan      # local zone, secondary
+dig @192.168.X.10 google.com           # recursion / forwarding works
+dig @192.168.X.10 google.com +dnssec   # +ad flag = DNSSEC validated
+dig @192.168.X.10 -x 192.168.X.30      # reverse lookup
 
-# Last 50 entries
-sudo journalctl -u unbound -n 50
-
-# Logs since yesterday
-sudo journalctl -u unbound --since yesterday
-
-# Logs for specific time range
-sudo journalctl -u unbound --since "2024-01-01 00:00:00" --until "2024-01-02 00:00:00"
+# Use the system resolver (whatever resolv.conf points at)
+dig router.home.lan
+nslookup router.home.lan
 ```
 
-### Enable Debug Logging
+## Cache inspection
 
 ```bash
-# Edit config to increase verbosity
-sudo nano /etc/unbound/unbound.conf.d/lan53.conf
-# Change: verbosity: 1  →  verbosity: 2
+# How many entries are in the cache right now
+sudo unbound-control stats_noreset | grep total.num.cachehits
 
-# Enable query logging temporarily
-sudo nano /etc/unbound/unbound.conf.d/lan53.conf
-# Change: log-queries: no  →  log-queries: yes
+# Dump the entire cache
+sudo unbound-control dump_cache | less
 
-# Restart to apply
-sudo systemctl restart unbound
-```
-
-### Common Log Patterns
-
-```bash
-# Filter for errors
-sudo journalctl -u unbound | grep -i error
-
-# Filter for specific domain
-sudo journalctl -u unbound | grep example.com
-
-# Count queries
-sudo journalctl -u unbound | grep "query:" | wc -l
-```
-
-## Backups and Recovery
-
-### Manual Backup
-
-```bash
-# Backup all configs
-sudo tar -czf ~/unbound-backup-$(date +%Y%m%d).tar.gz \
-    /etc/unbound/unbound.conf.d/ \
-    /etc/unbound/hosts.d/
-
-# Backup just TSV
-sudo cp /etc/unbound/hosts.d/mykk.foo.tsv \
-        /etc/unbound/hosts.d/mykk.foo.tsv.backup
-```
-
-### Automatic Backups
-
-```bash
-# List available backups
-ls -lh /etc/unbound/backups/
-
-# View a backup
-cat /etc/unbound/backups/local-zone-mykk-foo.conf.20240101-120000.bak
-```
-
-### Restore from Backup
-
-```bash
-# Restore specific backup
-sudo cp /etc/unbound/backups/local-zone-mykk-foo.conf.TIMESTAMP.bak \
-        /etc/unbound/unbound.conf.d/local-zone-mykk-foo.conf
-
-# Restart Unbound
-sudo systemctl restart unbound
-```
-
-## Performance Monitoring
-
-### Query Statistics
-
-```bash
-# If remote-control is enabled
-sudo unbound-control stats
-
-# Check cache size
-sudo unbound-control dump_cache | wc -l
-```
-
-### Cache Management
-
-```bash
-# Flush entire cache
-sudo unbound-control flush_zone .
-
-# Flush specific zone
-sudo unbound-control flush_zone mykk.foo
-
-# Flush specific name
+# Flush a specific entry (useful when a record changed and TTL is long)
 sudo unbound-control flush example.com
+
+# Flush an entire zone (recursive — includes subdomains)
+sudo unbound-control flush_zone home.lan
+
+# Nuclear option: clear everything
+sudo unbound-control reload
 ```
 
-### Resource Usage
+## Stats / monitoring
 
 ```bash
-# Memory usage
-ps aux | grep unbound
+# Quick stats snapshot
+sudo unbound-control stats_noreset | head -25
 
-# Detailed process info
-sudo systemctl status unbound
-
-# System resource limits
-sudo cat /proc/$(pidof unbound)/limits
+# Most useful counters:
+#   total.num.queries           total queries served
+#   total.num.cachehits         queries answered from cache
+#   total.num.cachemiss         queries that hit upstream
+#   total.requestlist.avg       avg pending queries (should be near 0)
+#   unwanted.queries            queries from clients we shouldn't be serving
 ```
 
-## Network Troubleshooting
+## Adding a host to the local zone
 
-### Check Listening Ports
+1. SSH into the **primary** resolver
+2. Edit `/etc/unbound/unbound.conf.d/local.conf`, add:
+   ```
+   local-data: "newhost.home.lan. IN A 192.168.X.42"
+   local-data-ptr: "192.168.X.42 newhost.home.lan"
+   ```
+3. `sudo unbound-checkconf && sudo systemctl reload unbound`
+4. Repeat steps 2–3 on the **secondary** resolver (or `scp` the file over and reload)
+5. Test: `dig @192.168.X.10 newhost.home.lan` and `dig @192.168.X.11 newhost.home.lan` — both should answer
+
+## Sync the two resolvers (one-liner)
 
 ```bash
-# Show Unbound listening
-sudo netstat -tulpn | grep unbound
-
-# Alternative with ss
-sudo ss -tulpn | grep unbound
-
-# Verify port 53 is open
-sudo lsof -i :53
+# Copy the canonical local.conf from primary -> secondary,
+# then patch the interface line and reload
+ssh dns-primary 'cat /etc/unbound/unbound.conf.d/local.conf' \
+  | sed 's/192.168.X.10/192.168.X.11/' \
+  | ssh dns-secondary 'sudo tee /etc/unbound/unbound.conf.d/local.conf > /dev/null \
+       && sudo unbound-checkconf \
+       && sudo systemctl reload unbound'
 ```
 
-### Test from Remote Client
+## DHCP — Kea operations
 
 ```bash
-# From another machine on the network
-dig @192.168.50.2 google.com
-nslookup google.com 192.168.50.2
+# Current leases (CSV format)
+sudo cat /var/lib/kea/kea-leases4.csv
 
-# Test DNSSEC
-dig @192.168.50.2 dnssec-failed.org
+# Just the active leases, formatted
+sudo awk -F, '$8==0 {print $1, $3, $9}' /var/lib/kea/kea-leases4.csv | column -t
+
+# Watch new leases come in
+sudo tail -f /var/log/kea-dhcp4.log
+# (or journalctl if Kea logs to systemd)
+sudo journalctl -u kea-dhcp4-server -f
+
+# Add a reservation: edit /etc/kea/kea-dhcp4.conf, then:
+sudo kea-dhcp4 -t /etc/kea/kea-dhcp4.conf      # validate
+sudo systemctl restart kea-dhcp4-server         # apply
 ```
 
-### Firewall Rules
+## Backups
 
 ```bash
-# Check if firewall is blocking
-sudo ufw status
-sudo iptables -L -n -v | grep 53
-
-# Allow DNS through firewall (if needed)
-sudo ufw allow 53/udp
-sudo ufw allow 53/tcp
+# Backup both resolver configs + Kea state
+ts=$(date +%F)
+ssh dns-primary "sudo tar czf - /etc/unbound /etc/kea /var/lib/kea" \
+  > ~/backups/dns-primary-$ts.tar.gz
+ssh dns-secondary "sudo tar czf - /etc/unbound" \
+  > ~/backups/dns-secondary-$ts.tar.gz
 ```
 
-## Sync Between Servers
-
-### Setup SSH Keys
+## Useful one-liners
 
 ```bash
-# Generate key on primary
-ssh-keygen -t ed25519 -C "dns-sync"
+# Which clients have queried me in the last hour?  (requires query log enabled)
+sudo journalctl -u unbound --since "1 hour ago" | awk '{print $5}' | sort -u
 
-# Copy to secondary
-ssh-copy-id user@192.168.50.3
+# Cache hit ratio (rough — over lifetime of the daemon)
+sudo unbound-control stats_noreset \
+  | awk -F= '/total.num.queries/{q=$2} /total.num.cachehits/{h=$2} END {printf "%.1f%%\n", 100*h/q}'
 
-# Test connection
-ssh user@192.168.50.3 "echo 'SSH works'"
+# Test that the forwarders (1.1.1.1 / 9.9.9.9) are reachable
+dig @1.1.1.1 google.com +short
+dig @9.9.9.9 google.com +short
 ```
-
-### Manual Sync
-
-```bash
-# From primary to secondary
-rsync -avz /etc/unbound/hosts.d/mykk.foo.tsv \
-    user@192.168.50.3:/etc/unbound/hosts.d/
-
-# SSH and regenerate on secondary
-ssh user@192.168.50.3 "sudo /usr/local/sbin/update_dns.sh"
-```
-
-### Verify Sync
-
-```bash
-# Compare TSV files
-diff /etc/unbound/hosts.d/mykk.foo.tsv \
-     <(ssh user@192.168.50.3 "cat /etc/unbound/hosts.d/mykk.foo.tsv")
-
-# Compare generated configs
-diff /etc/unbound/unbound.conf.d/local-zone-mykk-foo.conf \
-     <(ssh user@192.168.50.3 "cat /etc/unbound/unbound.conf.d/local-zone-mykk-foo.conf")
-```
-
-## Security Checks
-
-### Verify Access Control
-
-```bash
-# Test from LAN (should work)
-dig @192.168.50.2 google.com
-
-# Test from outside network (should refuse)
-# (Run this from external IP or use online DNS tools)
-```
-
-### Check DNSSEC
-
-```bash
-# Test DNSSEC validation
-dig @localhost dnssec-failed.org
-
-# Should return SERVFAIL if DNSSEC is working
-```
-
-### Audit Configuration
-
-```bash
-# Check for common misconfigurations
-sudo unbound-checkconf
-
-# Review security settings
-grep -E "access-control|hide-identity|hide-version" \
-    /etc/unbound/unbound.conf.d/lan53.conf
-```
-
-## Common Issues and Fixes
-
-### Issue: DNS Not Resolving
-
-```bash
-# Check if Unbound is running
-sudo systemctl status unbound
-
-# Check logs for errors
-sudo journalctl -u unbound -n 50
-
-# Test basic connectivity
-ping 192.168.50.2
-
-# Restart Unbound
-sudo systemctl restart unbound
-```
-
-### Issue: Config Validation Failed
-
-```bash
-# Check what's wrong
-sudo unbound-checkconf
-
-# Review recent changes
-ls -lht /etc/unbound/backups/
-
-# Restore last working config
-sudo cp /etc/unbound/backups/local-zone-mykk-foo.conf.*.bak \
-        /etc/unbound/unbound.conf.d/local-zone-mykk-foo.conf
-sudo systemctl restart unbound
-```
-
-### Issue: Slow Resolution
-
-```bash
-# Check if root hints are current
-ls -lh /var/lib/unbound/root.hints
-
-# Update root hints
-sudo /usr/local/sbin/update-unbound-root-hints.sh
-
-# Clear cache and restart
-sudo unbound-control flush_zone .
-sudo systemctl restart unbound
-```
-
-## Quick Reference Commands
-
-```bash
-# ✅ Add host and sync
-printf "newhost\t192.168.50.100\n" | sudo tee -a /etc/unbound/hosts.d/mykk.foo.tsv && \
-sudo /usr/local/sbin/update_dns.sh && \
-sudo /usr/local/sbin/sync_dns_to_secondary.sh
-
-# ✅ Full health check
-/usr/local/sbin/dns-check.sh && echo "DNS is healthy" || echo "DNS has issues"
-
-# ✅ View live queries (if logging enabled)
-sudo journalctl -u unbound -f | grep "query:"
-
-# ✅ One-liner restart
-sudo systemctl restart unbound && systemctl status unbound
-
-# ✅ Quick test both servers
-for s in 192.168.50.2 192.168.50.3; do echo "Testing $s:"; dig +short @$s google.com; done
-```
-
-## Environment Variables
-
-```bash
-# Customize script behavior (if supported)
-export DNS_DOMAIN="mykk.foo"
-export PRIMARY_IP="192.168.50.2"
-export SECONDARY_IP="192.168.50.3"
-```
-
-## Useful Aliases
-
-Add to `~/.bashrc` or `~/.zshrc`:
-
-```bash
-alias dns-update='sudo /usr/local/sbin/update_dns.sh'
-alias dns-sync='sudo /usr/local/sbin/sync_dns_to_secondary.sh'
-alias dns-check='/usr/local/sbin/dns-check.sh'
-alias dns-logs='sudo journalctl -u unbound -f'
-alias dns-status='sudo systemctl status unbound'
-alias dns-restart='sudo systemctl restart unbound'
-```
-
----
-
-**Pro Tip**: Bookmark this cheatsheet for quick reference!

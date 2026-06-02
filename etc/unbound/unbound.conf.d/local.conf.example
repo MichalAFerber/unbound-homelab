@@ -1,0 +1,85 @@
+# /etc/unbound/unbound.conf.d/local.conf
+#
+# Drop this in /etc/unbound/unbound.conf.d/ on each resolver host.
+# Replace `192.168.X.X` placeholders, generic hostnames, and the
+# `home.lan` example TLD with values that match your environment.
+#
+# On a two-resolver redundant setup, the only line that differs between
+# the primary and secondary hosts is the `interface:` line (each binds
+# to its own LAN IP).
+server:
+    # Listen on loopback + this host's LAN IP only
+    interface: 127.0.0.1
+    interface: 192.168.X.10           # primary:   .10
+    # interface: 192.168.X.11         # secondary: .11 (on the other host)
+
+    # Allow your LAN + loopback only — nobody on the internet
+    access-control: 192.168.X.0/24 allow
+    access-control: 127.0.0.0/8 allow
+    # access-control: 10.X.X.0/24 allow  # additional internal subnets
+
+    do-ip4: yes
+    do-ip6: no
+    do-udp: yes
+    do-tcp: yes
+
+    # Privacy / hardening
+    hide-identity: yes
+    hide-version: yes
+    qname-minimisation: yes
+    prefetch: yes
+
+    # Cache
+    cache-min-ttl: 300
+    cache-max-ttl: 86400
+    edns-buffer-size: 1232
+    max-udp-size: 1232
+
+    # DNSSEC validation
+    module-config: "validator iterator"
+
+    # ─── Local zone for your LAN domain ───────────────────────────
+    local-zone: "home.lan." static
+
+    # Network gear
+    local-data: "router.home.lan.        IN A 192.168.X.1"
+    local-data: "switch-01.home.lan.     IN A 192.168.X.81"
+    local-data: "ap-01.home.lan.         IN A 192.168.X.91"
+    local-data: "ap-02.home.lan.         IN A 192.168.X.92"
+
+    # DNS / DHCP servers
+    local-data: "dns-primary.home.lan.   IN A 192.168.X.10"
+    local-data: "dns-secondary.home.lan. IN A 192.168.X.11"
+
+    # Servers
+    local-data: "vm-host-01.home.lan.    IN A 192.168.X.20"
+    local-data: "vm-host-02.home.lan.    IN A 192.168.X.21"
+    local-data: "nas.home.lan.           IN A 192.168.X.30"
+    local-data: "media-server.home.lan.  IN A 192.168.X.31"
+
+    # Workstations
+    local-data: "desktop.home.lan.       IN A 192.168.X.50"
+    local-data: "laptop.home.lan.        IN A 192.168.X.51"
+
+    # Reverse PTR records (optional but recommended)
+    local-data-ptr: "192.168.X.1  router.home.lan"
+    local-data-ptr: "192.168.X.81 switch-01.home.lan"
+    local-data-ptr: "192.168.X.91 ap-01.home.lan"
+
+    # Wildcard for a reverse-proxy host (e.g. Caddy / NPM)
+    # All *.dev.home.lan resolves to the proxy box
+    local-data: "*.dev.home.lan.         IN A 192.168.X.30"
+
+# ─── Recursive resolver vs. forwarders ────────────────────────────
+# Two common patterns. Pick one — don't enable both.
+#
+# Pattern A (forwarders) — cached upstream, fastest in practice
+forward-zone:
+    name: "."
+    forward-addr: 1.1.1.1                       # Cloudflare
+    forward-addr: 9.9.9.9                       # Quad9
+    # forward-tls-upstream: yes                 # uncomment for DoT
+#
+# Pattern B (pure recursive — query root servers directly)
+# Comment out the forward-zone block above and Unbound will recurse
+# from the root hints by default. No additional config needed.

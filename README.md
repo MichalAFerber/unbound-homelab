@@ -1,283 +1,132 @@
 # 🛡️ Unbound Home Lab DNS
 
-A production-ready, redundant DNS infrastructure for home labs using Unbound on Raspberry Pi 4 servers.
+Redundant recursive DNS for a home lab — two **Unbound** resolvers on Ubuntu VMs, fed by a single **Kea** DHCPv4 server. All hosts on the LAN get DHCP from one place; DNS queries land on whichever resolver answers first.
 
-## Features
+🔗 Live README: <https://michalaferber.github.io/unbound-homelab/>
 
-- ✅ **Redundant DNS** across two Pi servers (primary/secondary)
-- ✅ **Recursive resolution** direct to root servers (no ISP forwarding)
-- ✅ **Local zone management** with easy TSV-based editing
-- ✅ **Automatic config sync** between servers
-- ✅ **Monthly root hints updates** via systemd timers
-- ✅ **Health monitoring** with consistency checks
-- ✅ **Security hardening** (access controls, DNSSEC, privacy)
-- ✅ **Automated backups** and rollback capability
+> **Note** — this repo was originally built around two Raspberry Pi 4 servers running a TSV-driven Unbound config with custom sync scripts. It has since been simplified: stock Unbound on Ubuntu VMs, no custom scripts, no automation. The current docs reflect the simplified setup.
 
-## Quick Start
+## What this gives you
 
-### Prerequisites
+- **Redundant DNS** — two Unbound resolvers; clients get both as `domain-name-servers` via DHCP
+- **Authoritative local zone** — your LAN's hosts resolve by name (e.g. `nas.home.lan` → `192.168.X.30`)
+- **Reverse DNS** — `dig -x 192.168.X.30` returns the hostname
+- **DHCP reservations** — pin specific MACs to specific IPs (network gear, servers)
+- **DNSSEC validation** at the resolver
+- **Cache + prefetch** — repeat queries answered locally in microseconds
 
-- Two Raspberry Pi 4 (or similar Linux servers)
-- Ubuntu/Debian-based OS
-- Static IP addresses configured
-- SSH access between servers (for sync)
+What this **doesn't** give you — and intentionally:
+- No ad-blocking. Add Pi-hole or AdGuard Home upstream if you want that.
+- No automatic config sync between the two resolvers. The two `local.conf` files are kept in sync manually. They diverge in exactly one line (the `interface:` binding).
+- No installer script. Two `apt install`s + drop-in config files is all there is.
 
-### Installation
+## Stack
 
-1. Clone this repository:
+| Role | Component | Where it runs |
+|---|---|---|
+| Recursive resolver (primary) | Unbound 1.19+ | Ubuntu 24.04 LTS VM |
+| Recursive resolver (secondary) | Unbound 1.19+ | Ubuntu 24.04 LTS VM |
+| DHCPv4 | Kea-DHCP4 | One of the resolver VMs (no DHCP redundancy in this design) |
+
+Both VMs run on a Proxmox host as Ubuntu Server VMs (1-2 vCPU, 1-2 GB RAM is plenty).
+
+## Quick start
+
+### 1. Install on each resolver
+
 ```bash
-git clone https://github.com/yourusername/unbound-homelab.git
-cd unbound-homelab
+sudo apt update
+sudo apt install -y unbound
 ```
 
-2. Run the installer:
+### 2. Drop in your `local.conf`
+
+Copy [`etc/unbound/unbound.conf.d/local.conf.example`](etc/unbound/unbound.conf.d/local.conf.example) to `/etc/unbound/unbound.conf.d/local.conf` on **each** resolver. Edit:
+
+- The `interface:` line → bind to that host's LAN IP (primary uses `.10`, secondary `.11`, or whatever your scheme is)
+- `access-control:` → your LAN subnet
+- `local-zone:` and `local-data:` lines → your LAN domain + host map
+
+### 3. Test, reload, verify
+
 ```bash
-sudo ./install.sh
+sudo unbound-checkconf
+sudo systemctl restart unbound
+sudo systemctl status unbound --no-pager
+
+# From a LAN client:
+dig @192.168.X.10 router.home.lan      # should return the local A
+dig @192.168.X.10 google.com           # should return a real A
+dig @192.168.X.10 google.com +dnssec   # ad flag = DNSSEC validated
 ```
 
-3. Edit your hosts file:
+### 4. Install Kea on one of the VMs
+
 ```bash
-sudo nano /etc/unbound/hosts.d/mykk.foo.tsv
+sudo apt install -y kea-dhcp4-server
 ```
 
-4. Generate configuration:
+Copy [`etc/kea/kea-dhcp4.conf.example`](etc/kea/kea-dhcp4.conf.example) to `/etc/kea/kea-dhcp4.conf`. Edit:
+
+- `interfaces` → the actual NIC name (often `enp6s18` on Proxmox VMs, `eth0` on bare metal)
+- `subnet4` block → your LAN subnet + pool range
+- `domain-name-servers` → IPs of your two Unbound resolvers
+- `reservations` → MAC-to-IP for your network gear
+
 ```bash
-sudo /usr/local/sbin/update_dns.sh
+sudo systemctl enable --now kea-dhcp4-server
+sudo systemctl status kea-dhcp4-server --no-pager
 ```
 
-5. Test resolution:
-```bash
-dig @localhost google.com
-dig @localhost yourhost.mykk.foo
-```
+### 5. Disable the router's built-in DHCP
+
+Your existing router/firewall (pfSense, OPNsense, Netgate, etc.) should stop handing out DHCP leases — otherwise clients race between the two. The router stays as the default gateway; Kea hands out the gateway IP as the `routers` option.
 
 ## Architecture
 
 ```
-┌─────────────────┐         ┌─────────────────┐
-│  pi4server      │         │  pi4server02    │
-│  192.168.50.2   │◄───────►│  192.168.50.3   │
-│  (Primary DNS)  │  Sync   │  (Secondary DNS)│
-└────────┬────────┘         └────────┬────────┘
-         │                           │
-         └─────────┬─────────────────┘
+                  ┌─────────────────────┐
+                  │  Router / Firewall  │
+                  │  192.168.X.1        │
+                  │  (gateway only —    │
+                  │   DHCP disabled)    │
+                  └──────────┬──────────┘
+                             │
+        ┌────────────────────┼────────────────────┐
+        │                    │                    │
+┌───────▼────────┐  ┌────────▼────────┐  ┌────────▼────────┐
+│ DNS Primary    │  │ DNS Secondary   │  │  LAN Clients    │
+│ 192.168.X.10   │  │ 192.168.X.11    │  │  192.168.X.100+ │
+│                │  │                 │  │  (DHCP pool)    │
+│ Unbound 1.19+  │  │ Unbound 1.19+   │  │                 │
+│ Kea-DHCP4 ─────┼──┼─────────────────┼─►│ resolv.conf:    │
+│                │  │                 │  │   .10           │
+│                │  │                 │  │   .11           │
+└───────┬────────┘  └────────┬────────┘  └─────────────────┘
+        │                    │
+        └──────────┬─────────┘
                    │
-         ┌─────────▼────────┐
-         │   Asus Router    │
-         │   DHCP Server    │
-         └─────────┬────────┘
-                   │
-         ┌─────────▼────────┐
-         │   LAN Clients    │
-         │  Auto-configure  │
-         └──────────────────┘
+        Recursive → root, or forward → 1.1.1.1 / 9.9.9.9
 ```
 
-## Configuration Files
+DHCP runs on **one** host only (typically the primary). DNS runs on **both**. If the primary VM goes down, DNS still works from the secondary. DHCP renewals will fail until the primary is back — but existing leases are valid for `valid-lifetime` (24 hours by default), so the LAN keeps working.
 
-### Primary Configuration
-- `/etc/unbound/unbound.conf.d/lan53.conf` - Main Unbound config
-- `/etc/unbound/hosts.d/mykk.foo.tsv` - Hosts database (TSV format)
-- `/etc/unbound/unbound.conf.d/local-zone-mykk-foo.conf` - Generated zone file
-
-### Scripts
-- `/usr/local/sbin/update_dns.sh` - Regenerate config from TSV
-- `/usr/local/sbin/sync_dns_to_secondary.sh` - Sync to secondary server
-- `/usr/local/sbin/update-unbound-root-hints.sh` - Update root hints
-- `/usr/local/sbin/dns-check.sh` - Health monitoring
-
-### Systemd Units
-- `update-unbound-root-hints.service` - Root hints update service
-- `update-unbound-root-hints.timer` - Monthly timer for updates
-
-## Usage
-
-### Adding a New Host
-
-```bash
-# Edit TSV file
-printf "newhost\t192.168.50.100\talias1,alias2\n" | sudo tee -a /etc/unbound/hosts.d/mykk.foo.tsv
-
-# Regenerate config
-sudo /usr/local/sbin/update_dns.sh
-
-# Sync to secondary (from primary)
-sudo /usr/local/sbin/sync_dns_to_secondary.sh
-```
-
-### Health Check
-
-```bash
-/usr/local/sbin/dns-check.sh
-```
-
-### Manual Root Hints Update
-
-```bash
-sudo /usr/local/sbin/update-unbound-root-hints.sh
-```
-
-### View Logs
-
-```bash
-# Real-time logs
-journalctl -u unbound -f
-
-# Last 50 entries
-journalctl -u unbound -n 50
-```
-
-## TSV File Format
-
-```tsv
-# hostname	ip_address	aliases (comma-separated, optional)
-pi4server	192.168.50.2	dns1
-plex	192.168.50.205	media,streaming
-truenas	192.168.50.202	nas,storage
-```
-
-## Security Features
-
-- **Access Control**: Only LAN subnet can query
-- **DNSSEC**: Validation enabled
-- **Privacy**: QNAME minimization, minimal responses
-- **Rate Limiting**: Optional protection against amplification attacks
-- **Identity Hiding**: No server version/identity disclosure
-
-## Router Configuration
-
-Configure your DHCP server to use both DNS servers:
-
-- **DNS Server 1**: 192.168.50.2
-- **DNS Server 2**: 192.168.50.3
-- **Search Domain**: mykk.foo (or your domain)
-
-## Troubleshooting
-
-### DNS not resolving
-
-```bash
-# Check if Unbound is running
-systemctl status unbound
-
-# Check logs
-journalctl -u unbound -n 50
-
-# Test manually
-dig @192.168.50.2 google.com
-dig @localhost google.com
-```
-
-### Config not syncing between servers
-
-```bash
-# Verify SSH connectivity
-ssh user@192.168.50.3
-
-# Check sync script
-sudo /usr/local/sbin/sync_dns_to_secondary.sh
-
-# Compare TSV files
-diff /etc/unbound/hosts.d/mykk.foo.tsv \
-     user@192.168.50.3:/etc/unbound/hosts.d/mykk.foo.tsv
-```
-
-### Root hints not updating
-
-```bash
-# Check timer status
-systemctl status update-unbound-root-hints.timer
-
-# Check last run
-systemctl list-timers
-
-# Manually trigger update
-sudo /usr/local/sbin/update-unbound-root-hints.sh
-```
-
-## Performance
-
-Typical query response times:
-- **Local zone**: <1ms
-- **Cached external**: ~2ms
-- **Uncached external**: ~180ms (recursive lookup)
-
-## Maintenance
-
-### Backup Configuration
-
-```bash
-# Manual backup
-sudo tar -czf unbound-backup-$(date +%Y%m%d).tar.gz \
-    /etc/unbound/unbound.conf.d/ \
-    /etc/unbound/hosts.d/
-```
-
-### Restore from Backup
-
-```bash
-# Restore from automatic backup
-sudo cp /etc/unbound/backups/local-zone-mykk-foo.conf.TIMESTAMP.bak \
-        /etc/unbound/unbound.conf.d/local-zone-mykk-foo.conf
-sudo systemctl restart unbound
-```
-
-## Project Structure
+## Repo layout
 
 ```
 unbound-homelab/
-├── install.sh                          # Main installation script
-├── README.md                           # This file
-├── scripts/
-│   ├── update_dns.sh                   # Regenerate config from TSV
-│   ├── sync_dns_to_secondary.sh        # Sync to secondary server
-│   ├── update-unbound-root-hints.sh    # Update root hints
-│   └── dns-check.sh                    # Health monitoring
-├── systemd/
-│   ├── update-unbound-root-hints.service
-│   └── update-unbound-root-hints.timer
 ├── etc/
-│   ├── unbound.conf.d/
-│   │   ├── lan53.conf                  # Main config
-│   │   └── local-zone-mykk-foo.conf.example
-│   └── hosts.d/
-│       └── mykk.foo.tsv.example        # Example hosts file
-└── docs/
-    ├── ARCHITECTURE.md                 # Architecture details
-    ├── CHEATSHEET.md                   # Command reference
-    └── TROUBLESHOOTING.md              # Detailed troubleshooting
+│   ├── unbound/unbound.conf.d/local.conf.example
+│   └── kea/kea-dhcp4.conf.example
+├── docs/
+│   ├── ARCHITECTURE.md         deeper architectural detail + rationale
+│   ├── CHEATSHEET.md           one-screen ops reference
+│   └── TROUBLESHOOTING.md      when DNS is broken, look here
+├── _config.yml                 Jekyll/cayman theme for GitHub Pages
+├── LICENSE                     MIT
+└── README.md                   you are here
 ```
-
-## Contributing
-
-Contributions are welcome! Please:
-1. Fork the repository
-2. Create a feature branch
-3. Make your changes
-4. Test thoroughly
-5. Submit a pull request
 
 ## License
 
-MIT License - see LICENSE file for details
-
-## Acknowledgments
-
-- Unbound DNS resolver by NLnet Labs
-- Root hints from IANA
-- Inspired by the home lab community
-
-## Related Projects
-
-- [Pi-hole](https://pi-hole.net/) - Network-wide ad blocking
-- [Unbound](https://nlnetlabs.nl/projects/unbound/) - Validating recursive DNS
-- [dnscrypt-proxy](https://github.com/DNSCrypt/dnscrypt-proxy) - DNS encryption
-
-## Support
-
-- **Issues**: [GitHub Issues](https://github.com/MichalAFerber/unbound-homelab/issues)
-- **Blog Post**: [Full writeup on michalferber.me](https://michalferber.me/2025-09-22-building-a-redundant-unbound-dns-setup-in-my-home-lab)
-
----
-
-**Created with ❤️ by Michal Ferber, aka TechGuyWithABeard**
+MIT — see [LICENSE](LICENSE).

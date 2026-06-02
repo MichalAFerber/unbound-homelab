@@ -1,0 +1,75 @@
+{
+  // /etc/kea/kea-dhcp4.conf
+  //
+  // Single Kea DHCPv4 server pushing DNS settings to both Unbound resolvers.
+  // Replace `192.168.X.*` IPs, MAC addresses, and hostnames with values from
+  // your environment.
+  "Dhcp4": {
+    "interfaces-config": {
+      "interfaces": ["enp6s18"]
+    },
+    "control-socket": {
+      "socket-type": "unix",
+      "socket-name": "/run/kea/kea4-ctrl-socket"
+    },
+    "lease-database": {
+      "type": "memfile",
+      "persist": true,
+      "name": "/var/lib/kea/kea-leases4.csv",
+      "lfc-interval": 3600
+    },
+    "expired-leases-processing": {
+      "reclaim-timer-wait-time": 10,
+      "flush-reclaimed-timer-wait-time": 25,
+      "hold-reclaimed-time": 3600,
+      "max-reclaim-leases": 100,
+      "max-reclaim-time": 250,
+      "unwarned-reclaim-cycles": 5
+    },
+    "valid-lifetime": 86400,
+    "renew-timer": 43200,
+    "rebind-timer": 75600,
+    "loggers": [
+      {
+        "name": "kea-dhcp4",
+        "output_options": [{ "output": "stdout", "pattern": "%-5p %m\n" }],
+        "severity": "INFO"
+      }
+    ],
+    "reservations-global": false,
+    "reservations-in-subnet": true,
+    "reservations-out-of-pool": true,
+    "subnet4": [
+      {
+        "id": 1,
+        "subnet": "192.168.X.0/24",
+        "pools": [
+          { "pool": "192.168.X.100 - 192.168.X.200" }
+        ],
+        "option-data": [
+          { "name": "routers",              "data": "192.168.X.1" },
+          { "name": "domain-name-servers",  "data": "192.168.X.10, 192.168.X.11" },
+          { "name": "domain-name",          "data": "home.lan" },
+          { "name": "domain-search",        "data": "home.lan" }
+        ],
+        "reservations": [
+          {
+            "hw-address": "aa:bb:cc:dd:ee:01",
+            "ip-address": "192.168.X.81",
+            "hostname":   "switch-01"
+          },
+          {
+            "hw-address": "aa:bb:cc:dd:ee:91",
+            "ip-address": "192.168.X.91",
+            "hostname":   "ap-01"
+          },
+          {
+            "hw-address": "aa:bb:cc:dd:ee:92",
+            "ip-address": "192.168.X.92",
+            "hostname":   "ap-02"
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -1,544 +1,142 @@
-# Architecture Documentation
+# Architecture
 
-Detailed technical architecture of the redundant Unbound DNS setup.
+Deeper dive into how the redundant Unbound + Kea DHCP setup is structured and why.
 
 ## Overview
 
-This system provides redundant recursive DNS resolution for a home lab environment using two Raspberry Pi 4 servers running Unbound. The architecture emphasizes reliability, security, and ease of maintenance.
+Two Ubuntu Server VMs run **Unbound** as recursive caching resolvers. **Kea-DHCP4** runs on **one** of the two VMs (no DHCP redundancy by design — see "Why not redundant DHCP?" below). Both resolvers are handed out to LAN clients via DHCP's `domain-name-servers` option, so client OSes (resolv.conf / NetworkManager / Windows DNS Client) round-robin between them.
 
-## System Components
-
-### Hardware Layer
+## Topology
 
 ```
-┌─────────────────────────────┐       ┌─────────────────────────────┐
-│     Raspberry Pi 4 (4GB)    │       │     Raspberry Pi 4 (4GB)    │
-│    pi4server (Primary)      │       │  pi4server02 (Secondary)    │
-│    192.168.50.2             │       │    192.168.50.3             │
-│                             │       │                             │
-│  - Ubuntu Server 24.04      │       │  - Ubuntu Server 24.04      │
-│  - 4GB RAM                  │       │  - 4GB RAM                  │
-│  - Ethernet (1Gbps)         │       │  - Ethernet (1Gbps)         │
-└─────────────────────────────┘       └─────────────────────────────┘
-             │                                     │
-             └─────────────┬───────────────────────┘
-                           │
-                    ┌──────▼───────┐
-                    │ Asus Router  │
-                    │ DHCP Server  │
-                    │   Gateway    │
-                    └──────┬───────┘
-                           │
-                    ┌──────▼───────┐
-                    │ LAN Clients  │
-                    │  (DHCP)      │
-                    └──────────────┘
+                ┌───────────────────────────────────────┐
+                │  Internet                             │
+                │  ── 1.1.1.1 / 9.9.9.9 (forwarders) ── │
+                │  ── or root servers (recursive)    ── │
+                └────────────────────┬──────────────────┘
+                                     │
+                              ┌──────▼──────┐
+                              │   Router    │  Default gateway only.
+                              │ 192.168.X.1 │  DHCP **disabled** on the router.
+                              └──────┬──────┘
+                                     │ LAN (1 GbE)
+              ┌──────────────────────┼──────────────────────┐
+              │                      │                      │
+        ┌─────▼─────┐          ┌─────▼─────┐         ┌──────▼──────┐
+        │  DNS-1    │          │  DNS-2    │         │ LAN clients │
+        │  .10      │          │  .11      │         │  .100-.200  │
+        │           │          │           │         │  (DHCP pool)│
+        │ Unbound   │          │ Unbound   │         └─────────────┘
+        │ Kea-DHCP4 │          │           │
+        └───────────┘          └───────────┘
+              ▲                      ▲
+              └──────────────────────┘
+              Both serve queries from clients;
+              clients have both in resolv.conf
 ```
 
-### Software Stack
+## Software layers
 
 ```
-┌─────────────────────────────────────────────────┐
-│                 Application Layer                │
-│  - dig, nslookup, host (DNS query tools)        │
-└─────────────────────────────────────────────────┘
-                       ↕
-┌─────────────────────────────────────────────────┐
-│              DNS Resolution Layer                │
-│  - Unbound 1.19+ (Recursive resolver)           │
-│  - Local zone: mykk.foo                         │
-│  - DNSSEC validation                            │
-└─────────────────────────────────────────────────┘
-                       ↕
-┌─────────────────────────────────────────────────┐
-│             Configuration Layer                  │
-│  - TSV source files                             │
-│  - Generated Unbound configs                    │
-│  - Systemd services/timers                      │
-└─────────────────────────────────────────────────┘
-                       ↕
-┌─────────────────────────────────────────────────┐
-│                Operating System                  │
-│  - Ubuntu Server 24.04 LTS                      │
-│  - systemd init system                          │
-│  - rsync for file sync                          │
-└─────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────┐
+│  Ubuntu Server 24.04 LTS (noble)                 │
+├──────────────────────────────────────────────────┤
+│  systemd-resolved   (disabled — Unbound owns 53) │
+│  Unbound 1.19+      (recursive caching resolver) │
+│  Kea-DHCP4          (only on DNS-1)              │
+│  ufw / iptables     (LAN-only DNS exposure)      │
+└──────────────────────────────────────────────────┘
 ```
 
-## DNS Query Flow
+`systemd-resolved` is disabled on both VMs so Unbound can bind to `*:53`. The two services don't share port 53.
 
-### External Domain Resolution
+## Configuration model
 
-```
-Client                Primary DNS              Root Servers            Authoritative
-Device               (192.168.50.2)           (a-m.root-servers.net)     Servers
-  │                        │                          │                     │
-  │  Query: google.com     │                          │                     │
-  ├───────────────────────►│                          │                     │
-  │                        │  Query: . NS?            │                     │
-  │                        ├─────────────────────────►│                     │
-  │                        │◄─────────────────────────┤                     │
-  │                        │  Referral: com. NS       │                     │
-  │                        │                          │                     │
-  │                        │  Query: google.com NS?   │                     │
-  │                        ├─────────────────────────────────────────────────►
-  │                        │◄─────────────────────────────────────────────────
-  │                        │  Response: 142.250.x.x   │                     │
-  │◄───────────────────────┤                          │                     │
-  │  Response: 142.250.x.x │                          │                     │
-  │                        │                          │                     │
-  │                   [Cached for TTL]                │                     │
+The Unbound config has two parts that live in two different files:
+
+| File | Purpose | Sync between hosts? |
+|---|---|---|
+| `/etc/unbound/unbound.conf` | Distro-default top-level config — just includes `unbound.conf.d/*.conf` | Yes (distro default, identical) |
+| `/etc/unbound/unbound.conf.d/local.conf` | All custom config: interface binding, access control, local zone, forwarders | **Mostly yes — diverges only on the `interface:` line** |
+
+The `local.conf` file on DNS-1 differs from DNS-2 in exactly one line:
+
+```diff
+-    interface: 192.168.X.10
++    interface: 192.168.X.11
 ```
 
-### Local Zone Resolution
+Everything else is byte-identical. **Sync is manual** — when you add a host, you edit both files. There is intentionally no rsync/git-sync automation; the surface area is small enough that drift is cheap to detect (any client can `dig @.10 X` vs `dig @.11 X` to spot it).
 
-```
-Client                Primary DNS              Local Zone Config
-Device               (192.168.50.2)           (static data)
-  │                        │                          │
-  │  Query: plex.mykk.foo  │                          │
-  ├───────────────────────►│                          │
-  │                        │  Lookup: local-zone      │
-  │                        ├─────────────────────────►│
-  │                        │◄─────────────────────────┤
-  │                        │  Return: 192.168.50.205  │
-  │◄───────────────────────┤                          │
-  │  Response: 192.168.50.205                         │
-  │                        │                          │
-  │                   [No caching needed]             │
-```
+## Local zone
 
-### Failover Scenario
+The `local-zone: "home.lan." static` line tells Unbound:
+1. This zone is authoritative locally (don't go ask the internet about `home.lan`)
+2. Only data we explicitly define exists (NXDOMAIN for anything else)
 
-```
-Client                Primary DNS              Secondary DNS
-Device               (192.168.50.2)           (192.168.50.3)
-  │                        │                          │
-  │  Query: google.com     │                          │
-  ├───────────────────────►│                          │
-  │                        X (Server Down)            │
-  │                        │                          │
-  │  [Timeout after 2s]    │                          │
-  │                        │                          │
-  │  Query: google.com     │                          │
-  ├──────────────────────────────────────────────────►│
-  │                        │                          │
-  │◄──────────────────────────────────────────────────┤
-  │  Response: 142.250.x.x │                          │
-  │                        │                          │
+The `local-data:` lines define forward records (A). The `local-data-ptr:` lines define reverse records (PTR). A wildcard `*.dev.home.lan.` is used to point an entire subdomain at a reverse-proxy host without listing every subdomain individually.
+
+## Recursive vs forwarders
+
+Both modes are valid; the example config has forwarders enabled.
+
+**Forwarders** (`forward-zone: "."`) — Unbound asks Cloudflare/Quad9 for anything not in the cache or local zone. Pros: faster (CDN-anycast), warmed cache. Cons: those resolvers see your queries.
+
+**Pure recursive** — Unbound walks the DNS hierarchy from the root servers down. Pros: nobody sees your queries except the authoritative servers. Cons: slightly slower first hit; uses root hints.
+
+To switch from forwarders to pure recursive: comment out the entire `forward-zone:` block in `local.conf` and `systemctl reload unbound`. Unbound's compiled-in root hints take over.
+
+## DNSSEC
+
+`module-config: "validator iterator"` enables DNSSEC validation. The trust anchor is `/var/lib/unbound/root.key`, auto-managed by the `unbound-anchor` tool on the distro's monthly schedule. No manual maintenance required.
+
+Verify DNSSEC is working:
+
+```bash
+dig @192.168.X.10 dnssec-failed.org +dnssec    # should return SERVFAIL
+dig @192.168.X.10 cloudflare.com +dnssec       # should have +ad flag
 ```
 
-## Configuration Management
+## DHCP (Kea)
 
-### Data Flow: From TSV to Active Config
+Kea is a Linux-native DHCP server from ISC, lighter than ISC dhcpd and trivial to configure as a JSON file. The relevant pieces:
 
-```
-┌──────────────────────────────────────────────────────────┐
-│  1. Source of Truth                                      │
-│  /etc/unbound/hosts.d/mykk.foo.tsv                      │
-│                                                          │
-│  hostname<TAB>ip<TAB>aliases                            │
-│  plex<TAB>192.168.50.205<TAB>media,streaming           │
-└──────────────────────┬───────────────────────────────────┘
-                       │
-                       ▼
-┌──────────────────────────────────────────────────────────┐
-│  2. Generation Script                                    │
-│  /usr/local/sbin/update_dns.sh                          │
-│                                                          │
-│  - Parse TSV file                                       │
-│  - Generate A records                                   │
-│  - Generate PTR records                                 │
-│  - Generate CNAME aliases                               │
-│  - Create timestamped backup                            │
-└──────────────────────┬───────────────────────────────────┘
-                       │
-                       ▼
-┌──────────────────────────────────────────────────────────┐
-│  3. Generated Configuration                              │
-│  /etc/unbound/unbound.conf.d/local-zone-mykk-foo.conf   │
-│                                                          │
-│  server:                                                │
-│    local-zone: "mykk.foo." static                       │
-│    local-data: "plex.mykk.foo. IN A 192.168.50.205"    │
-│    local-data: "media.mykk.foo. IN CNAME plex.mykk.foo"│
-└──────────────────────┬───────────────────────────────────┘
-                       │
-                       ▼
-┌──────────────────────────────────────────────────────────┐
-│  4. Validation                                           │
-│  unbound-checkconf                                      │
-│                                                          │
-│  - Syntax validation                                    │
-│  - Semantic checks                                      │
-│  - If fails: restore backup                             │
-└──────────────────────┬───────────────────────────────────┘
-                       │
-                       ▼
-┌──────────────────────────────────────────────────────────┐
-│  5. Activation                                           │
-│  systemctl restart unbound                              │
-│                                                          │
-│  - Reload configuration                                 │
-│  - Clear caches                                         │
-│  - Start answering queries                              │
-└──────────────────────────────────────────────────────────┘
-```
+- **`subnet4`** — your LAN subnet + dynamic pool range
+- **`option-data`** — pushed to clients on every lease. `domain-name-servers` is the redundancy mechanism (both Unbound IPs).
+- **`reservations`** — MAC-to-IP bindings for infrastructure (switches, APs, anything that must have a predictable IP)
+- **`lease-database`** — memfile (CSV) is fine for home-scale. Switch to MySQL/Postgres only if you have >1000 leases or want HA.
 
-### Synchronization Flow (Primary → Secondary)
+### Why not redundant DHCP?
 
-```
-┌────────────────────────────────────────────────────────────┐
-│  Primary Server (192.168.50.2)                             │
-│                                                            │
-│  1. TSV file updated                                       │
-│  2. update_dns.sh regenerates config                       │
-│  3. Unbound restarted                                      │
-└────────────────────┬───────────────────────────────────────┘
-                     │
-                     │ sync_dns_to_secondary.sh
-                     │
-                     ▼
-┌────────────────────────────────────────────────────────────┐
-│  SSH + rsync                                               │
-│                                                            │
-│  rsync -avz TSV → secondary                               │
-│  ssh secondary "sudo update_dns.sh"                       │
-└────────────────────┬───────────────────────────────────────┘
-                     │
-                     ▼
-┌────────────────────────────────────────────────────────────┐
-│  Secondary Server (192.168.50.3)                           │
-│                                                            │
-│  1. Receives updated TSV                                   │
-│  2. update_dns.sh regenerates config                       │
-│  3. Unbound restarted                                      │
-│  4. Now serving identical zone data                        │
-└────────────────────────────────────────────────────────────┘
-```
+Kea supports HA (failover via the HA hook library), but at home scale it's overkill:
 
-## File System Layout
+- DHCP leases are valid for 24 hours (`valid-lifetime: 86400`)
+- A primary failure doesn't drop existing clients off the network
+- You have 24 hours to restart the Kea VM before anyone's lease expires
+- Restoring from a daily backup of `kea-dhcp4.conf` + `/var/lib/kea/` is a 30-second operation
 
-```
-/etc/unbound/
-├── unbound.conf                    # Main Unbound config (usually includes .d/)
-├── unbound.conf.d/
-│   ├── lan53.conf                  # Server-specific config (interface, ACLs, etc.)
-│   └── local-zone-mykk-foo.conf    # Generated local zone (auto-created)
-├── hosts.d/
-│   └── mykk.foo.tsv                # Source of truth for DNS records
-└── backups/
-    └── local-zone-mykk-foo.conf.YYYYMMDD-HHMMSS.bak  # Timestamped backups
+Cost-benefit: HA Kea = 2× config complexity for a problem that resolves itself in a day. Skip it.
 
-/var/lib/unbound/
-├── root.hints                      # DNS root servers list (updated monthly)
-└── root.key                        # DNSSEC trust anchor (auto-managed)
+## Hardening
 
-/usr/local/sbin/
-├── update_dns.sh                   # Regenerate config from TSV
-├── sync_dns_to_secondary.sh        # Sync to secondary server
-├── update-unbound-root-hints.sh    # Update root hints
-└── dns-check.sh                    # Health monitoring
+- **`access-control:`** — Unbound only answers queries from the LAN subnet + loopback. Open recursive resolvers are a DDoS amplification vector; do not skip this.
+- **`hide-identity:` / `hide-version:`** — don't tell the world what you're running
+- **Firewall** — UFW rules should restrict port 53 to the LAN interface only. The VMs shouldn't be reachable on 53/udp or 53/tcp from the WAN.
+- **DNSSEC validation** — protects against poisoned responses from upstream forwarders or cache attacks
 
-/etc/systemd/system/
-├── update-unbound-root-hints.service  # Root hints update service
-└── update-unbound-root-hints.timer    # Monthly trigger
-```
+## Failure modes
 
-## Network Architecture
+| Scenario | Outcome | Recovery |
+|---|---|---|
+| DNS-2 (secondary) VM down | Clients with .11 first in resolv.conf fall back to .10 after ~2s timeout. Minor latency only. | Boot DNS-2 |
+| DNS-1 (primary) VM down | Clients use .11 only. Kea also down → no new DHCP leases. Existing leases continue working. | Boot DNS-1; new clients picked up immediately |
+| Both Unbound down | LAN has no DNS. Internet works for IP-addressed traffic only. | Boot at least one VM |
+| Kea down, both Unbound up | DNS works. New devices can't get an IP. Existing leases continue for `valid-lifetime`. | Boot the Kea VM |
+| Router down | Whole LAN offline. DNS resolution within the LAN still works (resolvers + clients on same subnet). | Recover router |
 
-### Port Usage
+## Related
 
-| Service | Port | Protocol | Purpose |
-|---------|------|----------|---------|
-| DNS | 53 | UDP | Primary DNS queries |
-| DNS | 53 | TCP | Large responses, zone transfers |
-| SSH | 22 | TCP | Configuration sync between servers |
-
-### IP Addressing Scheme
-
-```
-Network: 192.168.50.0/24
-Gateway: 192.168.50.1 (Router)
-
-┌─────────────────────────────────────────┐
-│  Static Assignments (DHCP Reserved)     │
-├─────────────────────────────────────────┤
-│  192.168.50.2   - pi4server (DNS1)      │
-│  192.168.50.3   - pi4server02 (DNS2)    │
-│  192.168.50.200-220 - Lab servers       │
-├─────────────────────────────────────────┤
-│  DHCP Pool: 192.168.50.50-199          │
-└─────────────────────────────────────────┘
-```
-
-### DNS Query Path
-
-```
-[Client]
-   │
-   │ DNS Query (UDP/53)
-   ▼
-[Router DHCP]
-   │
-   │ Returns: DNS1=192.168.50.2, DNS2=192.168.50.3
-   ▼
-[Client OS]
-   │
-   │ Try DNS1 first
-   ▼
-[Unbound Primary - 192.168.50.2]
-   │
-   ├──► Local zone? → Return static data
-   │
-   └──► External? → Recursive lookup
-          │
-          ├──► Check cache
-          │     └──► Hit? Return cached
-          │
-          └──► Miss? Query root servers
-                └──► Follow referrals
-                     └──► Cache & return
-```
-
-## Security Architecture
-
-### Access Control Layers
-
-```
-┌─────────────────────────────────────────────────────────┐
-│  Layer 1: Network Firewall (Optional)                   │
-│  - Block external access to port 53                     │
-│  - Allow only LAN subnet                                │
-└─────────────────────────────────────────────────────────┘
-                          ↓
-┌─────────────────────────────────────────────────────────┐
-│  Layer 2: Unbound Access Control Lists                  │
-│  - access-control: 192.168.50.0/24 allow               │
-│  - access-control: 0.0.0.0/0 refuse                    │
-└─────────────────────────────────────────────────────────┘
-                          ↓
-┌─────────────────────────────────────────────────────────┐
-│  Layer 3: Query Privacy                                 │
-│  - QNAME minimization (RFC 7816)                       │
-│  - Minimal responses                                    │
-│  - Hide server identity/version                         │
-└─────────────────────────────────────────────────────────┘
-                          ↓
-┌─────────────────────────────────────────────────────────┐
-│  Layer 4: DNSSEC Validation                             │
-│  - Validate cryptographic signatures                    │
-│  - Prevent cache poisoning                              │
-│  - Detect tampering                                     │
-└─────────────────────────────────────────────────────────┘
-```
-
-### Trust Model
-
-```
-┌──────────────────┐
-│   Root Zone      │  ← IANA managed
-│   (trust anchor) │     - root.key
-└────────┬─────────┘     - Auto-updated via RFC 5011
-         │
-         ▼
-┌──────────────────┐
-│   TLD Zones      │  ← e.g., .com, .org, .net
-│   (DNSSEC chain) │
-└────────┬─────────┘
-         │
-         ▼
-┌──────────────────┐
-│  Domain Zones    │  ← e.g., google.com
-│  (signed)        │
-└────────┬─────────┘
-         │
-         ▼
-┌──────────────────┐
-│  Validated       │  ← Unbound verifies entire chain
-│  Response        │
-└──────────────────┘
-
-Local Zones (mykk.foo):
-  - Not DNSSEC signed (internal only)
-  - Trusted implicitly (static configuration)
-  - Not validated against external authority
-```
-
-## Scalability Considerations
-
-### Current Capacity
-
-- **Queries per second**: ~1000 (per server)
-- **Cache entries**: ~50,000 (16MB rrset cache)
-- **Concurrent clients**: Unlimited (LAN subnet)
-- **Memory usage**: ~100MB per server at peak
-
-### Scaling Options
-
-#### Vertical Scaling (Single Server)
-- Increase cache sizes (more RAM)
-- Add more threads (more CPU cores)
-- Enable prefetching for popular domains
-
-#### Horizontal Scaling (Add Servers)
-```
-Primary + Secondary + Tertiary
-    ↓         ↓         ↓
-  DNS1      DNS2      DNS3
-192.168.50.2 → .3 → .4
-
-Client receives all three
-Tries in order: DNS1 → DNS2 → DNS3
-```
-
-#### Load Balancing (Advanced)
-```
-         ┌──────────────┐
-         │ HAProxy/VIP  │
-         │ 192.168.50.5 │
-         └───────┬──────┘
-                 │
-     ┌───────────┼───────────┐
-     ▼           ▼           ▼
-  DNS1        DNS2        DNS3
-   .2          .3          .4
-```
-
-## Monitoring and Health
-
-### Health Check Flow
-
-```
-┌─────────────────────────────────────────┐
-│  dns-check.sh                           │
-│                                         │
-│  For each server (DNS1, DNS2):          │
-│    For each test host:                  │
-│      1. Query local domain              │
-│      2. Query external domain           │
-│      3. Compare responses               │
-│      4. Check service status            │
-└─────────────────────┬───────────────────┘
-                      │
-                      ▼
-        ┌─────────────────────────┐
-        │  All tests pass?        │
-        └─────────┬───────────────┘
-         YES │   │ NO
-             │   ▼
-             │   Report errors:
-             │   - Server unreachable
-             │   - Query timeout
-             │   - Mismatched responses
-             │   - Service not running
-             │
-             ▼
-         Success!
-         Exit 0
-```
-
-### Metrics to Monitor
-
-1. **Availability**
-   - Service uptime (systemd status)
-   - Query success rate
-   - Network reachability
-
-2. **Performance**
-   - Query response time
-   - Cache hit rate
-   - Memory usage
-
-3. **Configuration**
-   - Sync status between servers
-   - Backup age
-   - Root hints freshness
-
-## Disaster Recovery
-
-### Failure Scenarios
-
-#### Primary Server Failure
-```
-Normal Operation:          Primary Failed:
-    DNS1 → Success             DNS1 → Timeout
-    DNS2 → Standby             DNS2 → Success
-    
-Action: None required      Action: Fix DNS1, verify sync
-Impact: None visible       Impact: ~2s delay per query
-```
-
-#### Both Servers Failure
-```
-DNS1 → Timeout
-DNS2 → Timeout
-
-Action: Manual intervention required
-Impact: No DNS resolution (clients use ISP DNS if configured)
-
-Recovery:
-1. Fix hardware/network issues
-2. Restore from backups if needed
-3. Run dns-check.sh to verify
-```
-
-#### Configuration Corruption
-```
-Bad Config Deployed:
-   update_dns.sh detects → Validation fails
-   Restores backup → Restart with old config
-   
-Manual Override:
-   Restore from /etc/unbound/backups/
-   systemctl restart unbound
-```
-
-### Backup Strategy
-
-```
-┌─────────────────────────────────────────┐
-│  Automatic Backups                      │
-│  - Every config generation              │
-│  - Timestamped files                    │
-│  - Kept in /etc/unbound/backups/        │
-│  - Retention: Last 30 days              │
-└─────────────────────────────────────────┘
-         │
-         ▼
-┌─────────────────────────────────────────┐
-│  Manual Backups (Recommended)           │
-│  - Weekly tar.gz of /etc/unbound/       │
-│  - Store off-system (NAS, cloud)        │
-│  - Test restore procedure quarterly     │
-└─────────────────────────────────────────┘
-```
-
-## Future Enhancements
-
-### Planned Improvements
-
-1. **Pi-hole Integration**
-   - Ad-blocking upstream from Unbound
-   - DNS-level tracking protection
-
-2. **Prometheus Monitoring**
-   - Expose metrics endpoint
-   - Grafana dashboards
-   - Alerting on anomalies
-
-3. **Conditional Forwarding**
-   - Forward corporate domains to office DNS
-   - Forward IoT domain to isolated resolver
-
-4. **DNSSEC Signing**
-   - Sign local zones
-   - Full chain of trust
-
-5. **IPv6 Support**
-   - AAAA records for local hosts
-   - IPv6 recursive queries
-
----
-
-**Architecture designed for reliability, security, and maintainability in home lab environments.**
+- [`CHEATSHEET.md`](CHEATSHEET.md) — daily ops commands
+- [`TROUBLESHOOTING.md`](TROUBLESHOOTING.md) — diagnosing DNS issues
+- [Unbound documentation](https://unbound.docs.nlnetlabs.nl/)
+- [Kea documentation](https://kea.readthedocs.io/)
